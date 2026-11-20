@@ -40,20 +40,29 @@ def content_filter(response: str) -> dict:
     redacted = response
 
     # PII patterns to check
-    PII_PATTERNS = {
-        # TODO: Add regex patterns for:
-        # - VN phone number: r"0\d{9,10}"
-        # - Email: r"[\w.-]+@[\w.-]+\.[a-zA-Z]{2,}"
-        # - National ID (CMND/CCCD): r"\b\d{9}\b|\b\d{12}\b"
-        # - API key pattern: r"sk-[a-zA-Z0-9-]+"
-        # - Password pattern: r"password\s*[:=]\s*\S+"
+    pii_patterns = {
+        "vn_phone": r"(?:\+84|\b0)(?:[\s.-]?\d){9,10}\b",
+        "card_number": r"\b(?:\d{4}[\s-]?){3}\d{4}\b",
+        "email": r"[\w.-]+@[\w.-]+\.[a-zA-Z]{2,}",
+        "national_id": r"\b\d{9}\b|\b\d{12}\b",
+        "api_key": r"\bsk-[a-zA-Z0-9_-]+\b",
+        "password": r"(?:password|mật\s*khẩu)\s*(?:[:=]\s*[^\s,.]+|(?:is|là)\s+(?=[^\s,.]*\d)[^\s,.]+)",
+        "admin_password": r"\badmin123\b",
+        "database_host": r"\b[a-zA-Z0-9.-]*\.internal(?::\d+)?\b",
     }
 
-    for name, pattern in PII_PATTERNS.items():
+    for name, pattern in pii_patterns.items():
         matches = re.findall(pattern, response, re.IGNORECASE)
         if matches:
             issues.append(f"{name}: {len(matches)} found")
             redacted = re.sub(pattern, "[REDACTED]", redacted, flags=re.IGNORECASE)
+
+    # Obfuscated leaks (base64 / hex / ROT13 / reversed / spaced-out secret).
+    # Can't reliably redact in place → withhold the whole response.
+    from guardrails.secret_detect import contains_protected_secret, contains_secret_hint
+    if contains_protected_secret(redacted) or contains_secret_hint(redacted):
+        issues.append("protected_secret_obfuscated_or_hinted")
+        redacted = "[REDACTED] Response withheld by output guardrail: protected value detected."
 
     return {
         "safe": len(issues) == 0,
@@ -172,14 +181,23 @@ class OutputGuardrailPlugin(base_plugin.BasePlugin):
         if not response_text:
             return llm_response
 
-        # TODO: Implement logic:
-        # 1. Call content_filter(response_text)
-        #    - If issues found: replace llm_response.content with redacted version
-        #    - Increment self.redacted_count
-        # 2. If use_llm_judge: call llm_safety_check(response_text)
-        #    - If unsafe: replace llm_response.content with a safe message
-        #    - Increment self.blocked_count
-        # 3. Return llm_response (possibly modified)
+        filtered = content_filter(response_text)
+        if not filtered["safe"]:
+            llm_response.content = types.Content(
+                role="model",
+                parts=[types.Part.from_text(text=filtered["redacted"])],
+            )
+            self.redacted_count += 1
+            return llm_response
+
+        if self.use_llm_judge:
+            judge = await llm_safety_check(response_text)
+            if not judge["safe"]:
+                llm_response.content = types.Content(
+                    role="model",
+                    parts=[types.Part.from_text(text="Response blocked by output guardrail.")],
+                )
+                self.blocked_count += 1
 
         return llm_response  # TODO: modify if needed
 

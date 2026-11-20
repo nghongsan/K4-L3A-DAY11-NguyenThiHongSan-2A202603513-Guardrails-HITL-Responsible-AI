@@ -11,6 +11,7 @@ Status convention (không dùng True/False mơ hồ):
 from __future__ import annotations
 
 import re
+import unicodedata
 from typing import Literal
 
 from google.genai import types
@@ -21,6 +22,35 @@ from core.config import ALLOWED_TOPICS, BLOCKED_TOPICS
 
 # Quyết định rõ ràng — tránh đảo nghĩa True/False
 InputStatus = Literal["ALLOW", "BLOCK"]
+
+# Chặn input quá dài (token-flooding / cost attack, giấu injection trong văn bản dài)
+MAX_INPUT_CHARS = 4000
+
+# Cyrillic / Greek look-alikes that NFKC does not fold to Latin
+_HOMOGLYPHS = str.maketrans({
+    "а": "a", "е": "e", "о": "o", "р": "p", "с": "c", "у": "y", "х": "x", "і": "i",
+    "ј": "j", "ѕ": "s", "ԁ": "d", "ɡ": "g", "һ": "h", "ӏ": "l", "ո": "n", "ν": "v",
+    "α": "a", "ο": "o", "ρ": "p", "ε": "e", "ι": "i", "κ": "k", "τ": "t", "υ": "u",
+    "А": "a", "Е": "e", "О": "o", "Р": "p", "С": "c", "Х": "x", "І": "i", "Ѕ": "s",
+    "Α": "a", "Β": "b", "Ε": "e", "Ι": "i", "Κ": "k", "Μ": "m", "Ν": "n", "Ο": "o",
+    "Ρ": "p", "Τ": "t", "Χ": "x",
+})
+
+# Extra blocked themes beyond core.config.BLOCKED_TOPICS (off-topic even if a
+# banking keyword is sprinkled in, e.g. "write a keylogger ... payment").
+EXTRA_BLOCKED_TOPICS = [
+    "keylogger", "malware", "ransomware", "phishing", "virus", "trojan", "botnet",
+    "ddos", "sql injection", "crack password", "carding", "money laundering",
+    "rửa tiền", "lừa đảo",
+]
+
+
+def canonicalize(text: str) -> str:
+    """NFKC + strip every invisible/format char (Unicode Cf) + fold homoglyphs + lower."""
+    t = unicodedata.normalize("NFKC", text or "")
+    t = "".join(ch for ch in t if unicodedata.category(ch) != "Cf")
+    t = t.translate(_HOMOGLYPHS)
+    return re.sub(r"\s+", " ", t).strip().lower()
 
 
 # ============================================================
@@ -51,15 +81,64 @@ def detect_injection(user_input: str) -> InputStatus:
     Returns:
         ``"BLOCK"`` if injection detected (chặn), ``"ALLOW"`` otherwise (cho qua).
     """
-    INJECTION_PATTERNS = [
-        # TODO: Add at least 5 regex patterns
-        # Example:
-        # r"ignore (all )?(previous|above) instructions",
+    normalized = canonicalize(user_input)
+
+    injection_patterns = [
+        # Prompt extraction: repeat / summarize / translate what you were given
+        r"\b(?:repeat|recite|echo|copy|reproduce|summari[sz]e|paraphrase|translate|rewrite|list|output|dump)\b.*"
+        r"\b(?:everything|all|text|words?|lines?|content)\s+(?:above|before|preceding|prior)\b",
+        r"\b(?:repeat|recite|summari[sz]e|paraphrase|translate|rewrite|list|output|dump|print|show)\s+"
+        r"(?:back\s+)?(?:all\s+)?(?:of\s+)?your\s+(?:initial\s+|original\s+|hidden\s+|full\s+)?"
+        r"(?:instructions?|prompt|directives?|rules|context|configuration|config)\b",
+        r"\bverbatim\b",
+        r"\b(?:values?|settings?|secrets?|data)\s+(?:that\s+)?you\s+(?:were|are|have\s+been)\s+"
+        r"(?:configured|given|provided|initiali[sz]ed|set\s*up|loaded)\b",
+        r"\b(?:configured|initiali[sz]ed)\s+with\b",
+        # Other names for credentials
+        r"\b(?:secret|access|integration|private|signing|service|bearer)\s+(?:keys?|tokens?)\b",
+        r"\bs\W?k\W+(?:key|token|value|prefix)\b",
+        r"\bignore\s+(all\s+)?(previous|above|prior)\s+(instructions?|rules?|guidelines?)\b",
+        r"\b(?:you\s+are|from\s+now\s+on\s+you\s+are)\s+now\b",
+        r"\bsystem\s*(prompt|message|instruction)s?\b",
+        r"\breveal\s+(?:your\s+)?(?:instructions?|prompt|system\s+prompt)\b",
+        r"\bpretend\s+(?:that\s+)?(?:you\s+are|to\s+be)\b",
+        r"\bact\s+as\s+(?:a\s+|an\s+)?(?:dan|unrestricted|jailbroken)\b",
+        r"\b(?:reveal|disclose|show|tell|print|leak)\b.*\b(?:(?:your|the)\s+(?:instructions?|prompt)|password|secret|credentials?|api\s*key|internal\s+(?:notes?|config\w*|database|db))\b",
+        r"\b(?:tiết\s+lộ|cho\s+(?:tôi\s+)?(?:biết|xem))\b.*\b(?:mật\s+khẩu|api\s*key|khóa\s+bí\s+mật)\b",
+        r"\b(bypass|override|disable)\s+(?:all\s+)?(?:the\s+)?(?:safety|guardrails?|rules?|restrictions?)\b",
+        r"\bdo\s+not\s+(?:follow|obey)\s+(?:any\s+)?(?:previous\s+)?(?:instructions?|rules?)\b",
+        r"\b(bỏ\s+qua|làm\s+lại)\b.*\b(hướng\s+dẫn|quy\s+tắc)\b",
+        # Synonyms: disregard / forget / skip prior directions
+        r"\b(?:ignore|disregard|forget|skip|override|discard)\s+(?:all\s+|any\s+|the\s+|your\s+)*"
+        r"(?:previous|prior|above|earlier|original|preceding|system)\s+"
+        r"(?:instructions?|directions?|directives?|rules?|guidelines?|prompts?|orders?)\b",
+        # Asking directly for privileged credentials / infrastructure
+        r"\b(?:admin|administrator|root|system|staff|internal|master)\s*(?:password|passcode|pass|pw|credentials?|login)\b",
+        r"\bapi[\s_-]*keys?\b",
+        r"\b(?:db|database)\s*(?:host|endpoint|server|connection|url|address|credentials?)\b",
+        r"\b(?:config(?:uration)?|setup|internal)\s+(?:notes?|values?|fields?|files?|secrets?)\b",
+        # Exfiltration via encoding / spelling out
+        r"\b(?:encode|convert|translate|output|write|spell)\b.*\b(?:base64|hex(?:adecimal)?|rot13|binary|reversed?|backwards|letter\s+by\s+letter|character\s+by\s+character)\b",
+        # Vietnamese jailbreak / credential requests
+        r"\b(?:quên|bỏ\s+qua|phớt\s+lờ|không\s+cần\s+tuân\s+theo)\b.*\b(?:quy\s+định|hướng\s+dẫn|quy\s+tắc|chỉ\s+dẫn|luật)\b",
+        r"\bmật\s+khẩu\b.*\b(?:admin|quản\s+trị|hệ\s+thống|nội\s+bộ)\b",
+        r"\b(?:admin|quản\s+trị|hệ\s+thống|nội\s+bộ)\b.*\bmật\s+khẩu\b",
     ]
 
-    for pattern in INJECTION_PATTERNS:
-        if re.search(pattern, user_input, re.IGNORECASE):
-            return "BLOCK"
+    # Leetspeak + split-letter variants ("1gn0re", "i g n o r e")
+    leet = normalized.translate(str.maketrans("013457@$", "oieastas"))
+    despaced = re.sub(r"\b(\w) (?=\w\b)", r"\1", leet)
+    candidates = {normalized, leet, despaced}
+
+    for candidate in candidates:
+        for pattern in injection_patterns:
+            if re.search(pattern, candidate, re.IGNORECASE):
+                return "BLOCK"
+
+    # Confirmation attacks: input already carries a protected value
+    from guardrails.secret_detect import contains_protected_secret
+    if contains_protected_secret(normalized):
+        return "BLOCK"
     return "ALLOW"
 
 
@@ -84,14 +163,30 @@ def topic_filter(user_input: str) -> InputStatus:
         ``"BLOCK"`` = chặn (off-topic hoặc topic cấm).
         ``"ALLOW"`` = cho qua (câu banking hợp lệ).
     """
-    input_lower = user_input.lower()
+    input_lower = canonicalize(user_input)
+    # Bỏ dấu tiếng Việt để khớp ALLOWED_TOPICS ("tài khoản" -> "tai khoan")
+    input_lower = "".join(
+        ch for ch in unicodedata.normalize("NFD", input_lower)
+        if unicodedata.category(ch) != "Mn"
+    ).replace("đ", "d")
 
-    # TODO: Implement logic:
-    # 1. If input contains any blocked topic -> return "BLOCK"
-    # 2. If input doesn't contain any allowed topic -> return "BLOCK"
-    # 3. Otherwise -> return "ALLOW"
+    if not input_lower.strip():
+        return "BLOCK"
 
-    pass  # Replace with your implementation
+    def has_word(topic: str) -> bool:
+        # Left word-boundary: "atm" must not match inside "treatment".
+        # Prefix match allowed so "accounts", "transfers", "hacking" still count.
+        plain = "".join(
+            ch for ch in unicodedata.normalize("NFD", topic.lower())
+            if unicodedata.category(ch) != "Mn"
+        ).replace("đ", "d")
+        return re.search(rf"\b{re.escape(plain)}", input_lower) is not None
+
+    if any(has_word(t) for t in list(BLOCKED_TOPICS) + EXTRA_BLOCKED_TOPICS):
+        return "BLOCK"
+    if any(has_word(t) for t in ALLOWED_TOPICS):
+        return "ALLOW"
+    return "BLOCK"
 
 
 # ============================================================
@@ -144,14 +239,25 @@ class InputGuardrailPlugin(base_plugin.BasePlugin):
         self.total_count += 1
         text = self._extract_text(user_message)
 
-        # TODO: Implement logic:
-        # 1. Call detect_injection(text)
-        #    - If "BLOCK": increment blocked_count, return self._block_response("...")
-        # 2. Call topic_filter(text)
-        #    - If "BLOCK": increment blocked_count, return self._block_response("...")
-        # 3. If both return "ALLOW": return None (let message through)
+        if len(text) > MAX_INPUT_CHARS:
+            self.blocked_count += 1
+            return self._block_response(
+                f"Request blocked by input guardrail: input longer than {MAX_INPUT_CHARS} characters."
+            )
 
-        pass  # Replace with your implementation
+        if detect_injection(text) == "BLOCK":
+            self.blocked_count += 1
+            return self._block_response(
+                "Request blocked by input guardrail: prompt injection detected."
+            )
+
+        if topic_filter(text) == "BLOCK":
+            self.blocked_count += 1
+            return self._block_response(
+                "Request blocked by input guardrail: topic is outside the banking scope."
+            )
+
+        return None
 
 
 # ============================================================

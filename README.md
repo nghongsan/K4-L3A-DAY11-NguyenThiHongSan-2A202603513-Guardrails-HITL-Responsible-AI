@@ -1,5 +1,16 @@
 # Day 11 — Controlled Agent Security (2026)
 
+> **Học viên:** Nguyễn Thị Hồng San · **MSSV:** 2A202603513 · **Lớp:** L3A
+>
+> **Cách chạy nhanh** (từ gốc repo, sau khi `source .venv/bin/activate` và điền `.env`):
+> ```bash
+> python src/main.py --part 2   # CP2 — input/output guardrails (in terminal)
+> python src/main.py --part 3   # CP3 — Blue pipeline → outputs/results.json, audit_log.json, metrics.json
+> python src/main.py --part 4   # CP4 — tấn công Red + Red Advance → outputs/*attack*.json
+> pytest tests -q && python scripts/grade.py --submission-dir . --out outputs/grade_report.json
+> ```
+> **Blue pipeline:** RateLimit (sliding window/user) → Input guardrail (Unicode normalize, injection regex EN/VI, topic filter, giới hạn độ dài) → LLM `liquid/lfm-3-1.7b:free` → Output guardrail (redact secret/PII) · Audit + Monitoring là observer · Egress allowlist HTTPS VinBank + chặn payload nhạy cảm.
+
 > 👤 **Hình thức:** bài tập **cá nhân** (1 người / 1 MSSV).  
 > 🎯 **Mục tiêu:** đóng vai **Blue Team** để học cách xây Guardrails phòng thủ, rồi đóng vai **Red Team** để tấn công agent **Red** hoặc **Red Advance**.  
 > ✅ Làm theo **Checkpoint 1 → 5** trong [`CHECKPOINTS.md`](CHECKPOINTS.md) · nộp theo [`SUBMISSION.md`](SUBMISSION.md).
